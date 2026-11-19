@@ -29,10 +29,16 @@ function nextReqId(): string {
 function authOk(req: IncomingMessage): boolean {
   const h = req.headers.authorization;
   if (!h) return false;
-  const m = /^Bearer\s+(.+)$/i.exec(h);
-  if (!m || !m[1]) return false;
+  // Fast path for the usual "Bearer <token>" shape; no regex per request.
+  const lower = h.slice(0, 7).toLowerCase();
+  let token = lower === 'bearer ' || lower === 'bearer\t' ? h.slice(7) : '';
+  // Tolerate extra blanks after the scheme, as the old regex did.
+  let i = 0;
+  while (i < token.length && (token[i] === ' ' || token[i] === '\t')) i += 1;
+  if (i > 0) token = token.slice(i);
+  if (token === '') return false;
   const expected = process.env.MAKEFUN_SHOP_TOKEN;
-  if (expected) return m[1] === expected;
+  if (expected) return token === expected;
   return true;
 }
 

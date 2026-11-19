@@ -79,6 +79,9 @@ export function storeObject(repo: Repo, type: GitObjectType, data: Buffer): Oid 
 /** Drop cached generated packs (call whenever any ref moves). */
 export function invalidatePackCache(repo: Repo): void {
   repo.packCache.clear();
+  // Every cached git response below is a pure function of the repo's refs
+  // and reachable objects, so the same invalidation keeps them coherent.
+  repo.responseCache.clear();
 }
 
 /** Move a ref and drop cached packs. Use for every ref mutation. */
@@ -122,6 +125,14 @@ export interface Repo {
   updatedAt: string;
   /** Generated-pack cache: key `${owner}/${name}:${tipOid}:depth${n}`. */
   packCache: Map<string, Buffer>;
+  /**
+   * Cached whole git responses (advertisements, ls-refs, fetch): keyed by
+   * the request's arguments. Every value is a pure function of the repo's
+   * refs and reachable objects, so invalidatePackCache clears this too.
+   * The bench shape (50 identical shallow clones) hits the same key 50
+   * times, so the second and later clones skip the plan + framing work.
+   */
+  responseCache: Map<string, Buffer>;
 }
 
 export interface Issue {
@@ -189,6 +200,7 @@ export class Store {
       createdAt: now,
       updatedAt: now,
       packCache: new Map(),
+      responseCache: new Map(),
     };
     this.repos.set(repoKey(ownerLogin, name), repo);
     return repo;

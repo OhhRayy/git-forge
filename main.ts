@@ -21,6 +21,16 @@ const REGISTER_GIVE_UP_MS = 120_000;
 const REGISTER_REQUEST_TIMEOUT_MS = 5_000;
 const DONE_REQUEST_TIMEOUT_MS = 60_000;
 const DONE_RETRY_DELAY_MS = 1_000;
+/**
+ * Socket timeouts. Node's default keep-alive timeout (5 s) is shorter
+ * than the gaps between the suite's phases: the runner's pooled socket
+ * goes idle while a workload sets up, the server closes it, and the next
+ * request pays a fresh TCP connect instead of reusing the warm socket.
+ * 30 s comfortably spans every inter-phase gap in a trial, and the
+ * header timeout stays above it, as Node requires.
+ */
+const KEEP_ALIVE_TIMEOUT_MS = 30_000;
+const HEADERS_TIMEOUT_MS = 60_000;
 
 function pause(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -106,6 +116,8 @@ function closeServer(server: ReturnType<typeof createApp>): Promise<void> {
 
 async function run(): Promise<void> {
   const server = createApp();
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
   const base = suiteBase();
   const port = base === null ? localPort() : 0;
 
@@ -123,6 +135,19 @@ async function run(): Promise<void> {
   server.on('error', (err) => {
     console.error(`git-forge: server error: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
+  });
+
+  // A malformed HTTP request (bad request line / headers) must get a clean
+  // 400 and a closed socket, not a silent drop: a strict client reads a
+  // silent drop as a hangup. This is the HTTP-layer counterpart of the
+  // in-route malformed-body handling.
+  server.on('clientError', (err, socket) => {
+    console.error(`git-forge: client error: ${err instanceof Error ? err.message : String(err)}`);
+    if (socket.writable) {
+      socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    } else {
+      socket.destroy();
+    }
   });
 
   await new Promise<void>((resolve, reject) => {

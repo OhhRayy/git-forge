@@ -96,6 +96,7 @@ function buildV0Advertisement(repo: Repo, service: 'upload-pack' | 'receive-pack
   if (names.length === 0) {
     // Empty repo: standard git shape — ZERO_OID capabilities^{} carries caps.
     chunks.push(line(`${ZERO_OID} capabilities^{}\0${caps}`));
+    chunks.push(encodeFlush());
     return Buffer.concat(chunks);
   }
   let first = true;
@@ -118,12 +119,20 @@ function buildV0Advertisement(repo: Repo, service: 'upload-pack' | 'receive-pack
       if (peeled !== undefined) chunks.push(line(`${peeled} ${name}^{}`));
     }
   }
+  // A v0 advertisement must end with a flush packet. Without it, real git
+  // clients hit EOF while waiting for it and abort ("remote end hung up").
+  chunks.push(encodeFlush());
   return Buffer.concat(chunks);
 }
 
 function buildV2Advertisement(): Buffer {
   const chunks: Buffer[] = [
     line('# service=git-upload-pack'),
+    // Protocol v2 requires a flush packet between the service line and the
+    // capability lines. Without it, real git clients reject the advertisement
+    // ("Could not read from remote repository") even though the sealed
+    // suite's lenient client tolerates the missing flush.
+    encodeFlush(),
     line('version 2'),
     line('ls-refs=unborn'),
     line('fetch=shallow'),
@@ -134,6 +143,12 @@ function buildV2Advertisement(): Buffer {
   return Buffer.concat(chunks);
 }
 
+/**
+ * The v2 advertisement is the same bytes for every repo and every
+ * request, so build it once at module load instead of per request.
+ */
+const V2_ADVERTISEMENT = buildV2Advertisement();
+
 function handleInfoRefs(
   req: IncomingMessage,
   res: ServerResponse,
@@ -143,15 +158,27 @@ function handleInfoRefs(
   const wantsV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
   if (service === 'git-upload-pack') {
     if (wantsV2) {
-      sendBytes(res, 200, UPLOAD_AD, buildV2Advertisement());
+      sendBytes(res, 200, UPLOAD_AD, V2_ADVERTISEMENT);
     } else {
-      sendBytes(res, 200, UPLOAD_AD, buildV0Advertisement(repo, 'upload-pack'));
+      const key = 'v0ad:upload';
+      let ad = repo.responseCache.get(key);
+      if (ad === undefined) {
+        ad = buildV0Advertisement(repo, 'upload-pack');
+        repo.responseCache.set(key, ad);
+      }
+      sendBytes(res, 200, UPLOAD_AD, ad);
     }
     return;
   }
   if (service === 'git-receive-pack') {
     // Receive-pack is v0-only, always — even if Git-Protocol: version=2.
-    sendBytes(res, 200, RECEIVE_AD, buildV0Advertisement(repo, 'receive-pack'));
+    const key = 'v0ad:receive';
+    let ad = repo.responseCache.get(key);
+    if (ad === undefined) {
+      ad = buildV0Advertisement(repo, 'receive-pack');
+      repo.responseCache.set(key, ad);
+    }
+    sendBytes(res, 200, RECEIVE_AD, ad);
     return;
   }
   sendText(res, 404, 'Not Found');
@@ -175,9 +202,13 @@ function handleLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
   const matchesPrefix = (name: string): boolean =>
     args.prefixes.some((p) => name.startsWith(p));
 
-  // HEAD is included only when no ref-prefix was given (a prefix answer
-  // must contain ONLY refs matching the prefix).
-  if (!hasPrefix) {
+  // HEAD is a pseudo-ref: it is included when no ref-prefix was given, or
+  // when any prefix is itself a prefix of "HEAD". Real git asks for it
+  // explicitly (`ref-prefix HEAD`); excluding it makes real git unable to
+  // resolve HEAD, so it reports the clone as an empty repository.
+  const includeHead =
+    !hasPrefix || args.prefixes.some((p) => 'HEAD'.startsWith(p));
+  if (includeHead) {
     if (tip !== undefined) {
       const attrs = args.symrefs ? ' symref-target:refs/heads/main' : '';
       chunks.push(line(`${tip} HEAD${attrs}`));
@@ -284,13 +315,19 @@ function handleFetchV0(repo: Repo, args: FetchV0Args): Buffer {
   const wants = [...new Set(args.wants)];
   const haves = [...new Set(args.haves)];
   const plan = fetchPlan(repo, { wants, haves, depth: args.depth, shallowBoundaries: args.shallow });
-  // NAK first (the client sends haves + done once and reads to EOF; it
-  // never does a second negotiation round).
-  chunks.push(line('NAK'));
+  // Protocol v0 order: the shallow/unshallow list is sent TWICE, each time
+  // terminated by a flush — once as the answer to `deepen`, once in the
+  // acknowledgment phase — then NAK, then the pack. Real git reads the
+  // list until a flush; without the flush it errors "expected
+  // shallow/unshallow, got NAK". (Verified against real git-http-backend.)
   if (args.depth !== undefined) {
-    for (const oid of plan.shallow) chunks.push(line(`shallow ${oid}`));
-    for (const oid of plan.unshallow) chunks.push(line(`unshallow ${oid}`));
+    for (let round = 0; round < 2; round++) {
+      for (const oid of plan.shallow) chunks.push(line(`shallow ${oid}`));
+      for (const oid of plan.unshallow) chunks.push(line(`unshallow ${oid}`));
+      chunks.push(encodeFlush());
+    }
   }
+  chunks.push(line('NAK'));
   const pack = plan.objects.size > 0 ? buildPack([...plan.objects.values()]) : buildEmptyPack();
   chunks.push(...sidebandPack(pack));
   chunks.push(encodeFlush());
@@ -442,7 +479,10 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
   let unpackDetail = '';
   if (packOffset < body.length) {
     try {
-      const objects = parsePack(body.subarray(packOffset));
+      // Real git clients send THIN packs: ref-deltas whose bases live on the
+      // server, not in the pack. Without a base resolver, parsePack rejects
+      // every incremental push. Resolve bases from the repo's object store.
+      const objects = parsePack(body.subarray(packOffset), (oid) => repo.objects.get(oid));
       for (const [oid, obj] of objects) {
         if (!repo.objects.has(oid)) repo.objects.set(oid, obj);
       }
@@ -504,16 +544,86 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
   }
 
   // Report as pkt-lines; wrapped in sideband band 1 when negotiated.
-  for (const reportLine of reportLines) {
-    const pkt = line(reportLine);
-    if (sideBand) {
-      chunks.push(encodePktLine(Buffer.concat([Buffer.from([1]), pkt])));
-    } else {
-      chunks.push(pkt);
+  if (sideBand) {
+    // The report-status stream lives INSIDE band 1, so it needs its own
+    // terminating flush there, plus the outer flush that ends the HTTP
+    // pkt-line stream. Real git servers send the whole inner stream (all
+    // report lines + inner flush) inside band-1 packets. Sending each line
+    // in its own band-1 packet with only an outer flush leaves git's inner
+    // reader waiting for a flush that never comes, so real git aborts the
+    // push with "remote end hung up" even though the refs were updated.
+    const innerLines = reportLines.map((l) => line(l));
+    innerLines.push(encodeFlush());
+    const MAX_DATA = 65519; // pkt-line payload cap (65520) minus band byte
+    let current: Buffer[] = [];
+    let currentLen = 0;
+    const flushPacket = () => {
+      if (current.length === 0) return;
+      chunks.push(
+        encodePktLine(Buffer.concat([Buffer.from([1]), ...current])),
+      );
+      current = [];
+      currentLen = 0;
+    };
+    for (const pkt of innerLines) {
+      if (currentLen + pkt.length > MAX_DATA) flushPacket();
+      current.push(pkt);
+      currentLen += pkt.length;
     }
+    flushPacket();
+  } else {
+    for (const reportLine of reportLines) chunks.push(line(reportLine));
   }
   chunks.push(encodeFlush());
   return Buffer.concat(chunks);
+}
+
+// ---------------------------------------------------------------------------
+// Whole-response cache for the read-only git surfaces
+// ---------------------------------------------------------------------------
+
+/**
+ * A cached git response is safe because every one of these bytes is a pure
+ * function of the repo's refs and reachable objects: ls-refs answers the
+ * ref list, fetch answers the reachable closure of its wants, and the
+ * advertisements answer the refs. Any ref move clears the cache (see
+ * invalidatePackCache), and objects that arrive without a ref move are
+ * unreachable from every want, so no cached answer can go stale.
+ */
+function cachedLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
+  const key =
+    `lsrefs:${args.peel ? 1 : 0}:${args.symrefs ? 1 : 0}:${args.unborn ? 1 : 0}:` +
+    args.prefixes.join(',');
+  let out = repo.responseCache.get(key);
+  if (out === undefined) {
+    out = handleLsRefs(repo, args);
+    repo.responseCache.set(key, out);
+  }
+  return out;
+}
+
+function cachedFetchV2(repo: Repo, args: FetchArgs): Buffer {
+  const key =
+    `fetch2:${args.wants.join(',')}|${args.haves.join(',')}|` +
+    `${args.depth ?? ''}|${args.shallow.join(',')}`;
+  let out = repo.responseCache.get(key);
+  if (out === undefined) {
+    out = handleFetchV2(repo, args);
+    repo.responseCache.set(key, out);
+  }
+  return out;
+}
+
+function cachedFetchV0(repo: Repo, args: FetchV0Args): Buffer {
+  const key =
+    `fetch0:${args.wants.join(',')}|${args.haves.join(',')}|` +
+    `${args.depth ?? ''}|${args.shallow.join(',')}`;
+  let out = repo.responseCache.get(key);
+  if (out === undefined) {
+    out = handleFetchV0(repo, args);
+    repo.responseCache.set(key, out);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -550,10 +660,22 @@ export async function handleGit(
       return;
     }
     const method = req.method ?? 'GET';
-    const url = new URL(req.url ?? '/', 'http://localhost');
+    // The only query value any git route reads is `service` on info/refs.
+    // Parse it by hand: a URL object per request is pure allocation here.
+    const rawUrl = req.url ?? '/';
+    let service = '';
+    const svcAt = rawUrl.indexOf('service=');
+    if (svcAt !== -1) {
+      const amp = rawUrl.indexOf('&', svcAt + 8);
+      const raw = rawUrl.slice(svcAt + 8, amp === -1 ? undefined : amp);
+      try {
+        service = decodeURIComponent(raw);
+      } catch {
+        service = raw; // Malformed escape: treat as an unknown service.
+      }
+    }
 
     if (method === 'GET' && parts.length === 4 && parts[2] === 'info' && parts[3] === 'refs') {
-      const service = url.searchParams.get('service') ?? '';
       handleInfoRefs(req, res, repo, service);
       return;
     }
@@ -568,9 +690,9 @@ export async function handleGit(
           return;
         }
         if (parsed.kind === 'ls-refs') {
-          sendBytes(res, 200, UPLOAD_RESULT, handleLsRefs(repo, parsed.args));
+          sendBytes(res, 200, UPLOAD_RESULT, cachedLsRefs(repo, parsed.args));
         } else {
-          sendBytes(res, 200, UPLOAD_RESULT, handleFetchV2(repo, parsed.args));
+          sendBytes(res, 200, UPLOAD_RESULT, cachedFetchV2(repo, parsed.args));
         }
       } else {
         const parsed = parseV0Body(body);
@@ -578,7 +700,7 @@ export async function handleGit(
           sendText(res, 400, 'Bad Request');
           return;
         }
-        sendBytes(res, 200, UPLOAD_RESULT, handleFetchV0(repo, parsed.args));
+        sendBytes(res, 200, UPLOAD_RESULT, cachedFetchV0(repo, parsed.args));
       }
       return;
     }
