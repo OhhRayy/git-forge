@@ -17,10 +17,12 @@ import {
   PKT_LINE_MAX_PAYLOAD,
   buildEmptyPack,
   buildPack,
+  clientDepthFromBoundaries,
   decodePktLines,
   encodeFlush,
   encodePktLine,
   fetchPlan,
+  isAncestor,
   isFastForward,
   parsePack,
   peelToCommit,
@@ -89,7 +91,7 @@ function buildV0Advertisement(repo: Repo, service: 'upload-pack' | 'receive-pack
   chunks.push(encodeFlush());
   const caps =
     service === 'upload-pack'
-      ? 'side-band-64k thin-pack ofs-delta multi_ack multi_ack_detailed shallow agent=git-forge/1.0 symref=HEAD:refs/heads/main'
+      ? 'side-band-64k thin-pack ofs-delta multi_ack multi_ack_detailed shallow deepen-relative agent=git-forge/1.0 symref=HEAD:refs/heads/main'
       : 'report-status side-band-64k delete-refs ofs-delta agent=git-forge/1.0 symref=HEAD:refs/heads/main';
   const tip = repo.refs.get('refs/heads/main');
   const names = sortedRefNames(repo);
@@ -240,6 +242,10 @@ interface FetchArgs {
   haves: Oid[];
   shallow: Oid[];
   depth?: number;
+  /** Client sent `done`: the negotiation is over, a packfile must follow. */
+  done: boolean;
+  /** Client sent `deepen-relative`: deepen is relative to its own depth. */
+  deepenRelative?: boolean;
 }
 
 /** Wrap pack bytes as sideband band-1 pkt-lines (each ≤ 65520 bytes). */
@@ -259,33 +265,56 @@ function handleFetchV2(repo: Repo, args: FetchArgs): Buffer {
   const wants = [...new Set(args.wants)];
   const haves = [...new Set(args.haves)];
 
+  // Effective depth: with `deepen-relative` the client's own depth (from
+  // its shallow boundaries) is added to the requested deepen.
+  let depth = args.depth;
+  if (depth !== undefined && args.deepenRelative && args.shallow.length > 0) {
+    const clientDepth = clientDepthFromBoundaries(repo, wants, args.shallow);
+    if (clientDepth !== undefined) depth = depth + clientDepth;
+  }
+
   const plan = fetchPlan(repo, {
     wants,
     haves,
-    depth: args.depth,
+    depth,
     shallowBoundaries: args.shallow,
   });
 
-  // Acknowledgments section: NAK when the client offered haves; omitted
-  // for a plain clone (no haves), matching real git.
-  if (haves.length > 0) {
+  // The first have that is an ancestor of a want is a common commit.
+  // A tag want peels to its commit first: a have equal to the tag's
+  // target is common with that want.
+  const commonHave = (): Oid | undefined =>
+    haves.find((have) =>
+      wants.some((want) => isAncestor(repo, have, peelToCommit(repo, want) ?? want)),
+    );
+
+  if (!args.done && haves.length > 0) {
+    // Negotiation round (the client sent haves but no `done`): the
+    // acknowledgments section ONLY, per gitprotocol-v2 — no shallow-info,
+    // no packfile. The client answers with more haves or `done`; the
+    // stateless transport appends the 0002 response-end after the body.
     chunks.push(line('acknowledgments'));
-    chunks.push(line('NAK'));
+    const common = commonHave();
+    chunks.push(line(common !== undefined ? `ACK ${common}` : 'NAK'));
     chunks.push(encodeFlush());
+    return Buffer.concat(chunks);
   }
-  // Shallow-info section, only when depth was requested and a boundary exists.
-  if (args.depth !== undefined && (plan.shallow.length > 0 || plan.unshallow.length > 0)) {
+  // Done round (or a plain clone, which has no haves): the spec REQUIRES
+  // the acknowledgments section to be omitted once the client sends
+  // `done`, and real git dies on it in FETCH_GET_PACK ("expected
+  // 'packfile'"). Only shallow-info (when a boundary moved) + packfile.
+  if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
     chunks.push(line('shallow-info'));
     for (const oid of plan.shallow) chunks.push(line(`shallow ${oid}`));
     for (const oid of plan.unshallow) chunks.push(line(`unshallow ${oid}`));
     chunks.push(encodeFlush());
   }
   // Packfile section. Pack cache: only for the bench shape — no haves,
-  // a single want, and a depth — keyed by tip + depth.
+  // a single want, and a depth — keyed by tip + effective depth.
   chunks.push(line('packfile'));
   let pack: Buffer | undefined;
-  if (haves.length === 0 && wants.length === 1 && args.depth !== undefined) {
-    const key = `${repo.fullName}:${wants[0]}:depth${args.depth}`;
+  if (haves.length === 0 && wants.length === 1 && depth !== undefined) {
+    const key = `${repo.fullName}:${wants[0]}:depth${depth}`;
     pack = repo.packCache.get(key);
     if (pack === undefined) {
       pack = plan.objects.size > 0 ? buildPack([...plan.objects.values()]) : buildEmptyPack();
@@ -308,26 +337,66 @@ interface FetchV0Args {
   haves: Oid[];
   shallow: Oid[];
   depth?: number;
+  /** Client sent `done`: the negotiation is over, a packfile must follow. */
+  done: boolean;
+  /** Client sent `deepen-relative`: deepen is relative to its own depth. */
+  deepenRelative?: boolean;
 }
 
 function handleFetchV0(repo: Repo, args: FetchV0Args): Buffer {
   const chunks: Buffer[] = [];
   const wants = [...new Set(args.wants)];
   const haves = [...new Set(args.haves)];
-  const plan = fetchPlan(repo, { wants, haves, depth: args.depth, shallowBoundaries: args.shallow });
-  // Protocol v0 order: the shallow/unshallow list is sent TWICE, each time
-  // terminated by a flush — once as the answer to `deepen`, once in the
-  // acknowledgment phase — then NAK, then the pack. Real git reads the
-  // list until a flush; without the flush it errors "expected
-  // shallow/unshallow, got NAK". (Verified against real git-http-backend.)
-  if (args.depth !== undefined) {
-    for (let round = 0; round < 2; round++) {
+
+  // Effective depth: with `deepen-relative` the client's own depth (from
+  // its shallow boundaries) is added to the requested deepen.
+  let depth = args.depth;
+  if (depth !== undefined && args.deepenRelative && args.shallow.length > 0) {
+    const clientDepth = clientDepthFromBoundaries(repo, wants, args.shallow);
+    if (clientDepth !== undefined) depth = depth + clientDepth;
+  }
+
+  const plan = fetchPlan(repo, { wants, haves, depth, shallowBoundaries: args.shallow });
+
+  // The first have that is an ancestor of a want is a common commit.
+  // A tag want peels to its commit first: a have equal to the tag's
+  // target is common with that want.
+  const commonHave = (): Oid | undefined =>
+    haves.find((have) =>
+      wants.some((want) => isAncestor(repo, have, peelToCommit(repo, want) ?? want)),
+    );
+
+  // Shallow list: ONCE per response, only when a depth was requested.
+  // Real git reads it once per round (consume_shallow_list); a second copy
+  // in the same response breaks get_ack ("expected ACK/NAK, got 'shallow
+  // ...'"). When no depth was requested the client never reads a list, so
+  // none is sent — a stray list would be misread as the ACK/NAK line.
+  const shallowSection = (): void => {
+    if (depth !== undefined && (plan.shallow.length > 0 || plan.unshallow.length > 0)) {
       for (const oid of plan.shallow) chunks.push(line(`shallow ${oid}`));
       for (const oid of plan.unshallow) chunks.push(line(`unshallow ${oid}`));
       chunks.push(encodeFlush());
     }
+  };
+
+  if (!args.done) {
+    if (haves.length > 0) {
+      // Negotiation round: shallow list (if deepen) + one ACK/NAK, no pack.
+      shallowSection();
+      const common = commonHave();
+      chunks.push(line(common !== undefined ? `ACK ${common}` : 'NAK'));
+      return Buffer.concat(chunks);
+    }
+    // First round of a deepen request (no haves yet): the shallow list
+    // ONLY — the client reads it before it starts sending haves, so a
+    // NAK or a pack here would poison the next round's reads.
+    shallowSection();
+    return Buffer.concat(chunks);
   }
-  chunks.push(line('NAK'));
+  // Done round: shallow list (if deepen) + one ACK/NAK + the pack.
+  shallowSection();
+  const common = commonHave();
+  chunks.push(line(common !== undefined ? `ACK ${common}` : 'NAK'));
   const pack = plan.objects.size > 0 ? buildPack([...plan.objects.values()]) : buildEmptyPack();
   chunks.push(...sidebandPack(pack));
   chunks.push(encodeFlush());
@@ -386,7 +455,7 @@ function parseV2Body(
     }
     return { kind: 'ls-refs', args };
   }
-  const args: FetchArgs = { wants: [], haves: [], shallow: [] };
+  const args: FetchArgs = { wants: [], haves: [], shallow: [], done: false };
   for (const arg of argLines) {
     if (arg.startsWith('want ')) args.wants.push(arg.slice(5).trim());
     else if (arg.startsWith('have ')) args.haves.push(arg.slice(5).trim());
@@ -394,7 +463,8 @@ function parseV2Body(
     else if (arg.startsWith('deepen ')) {
       const n = parseInt(arg.slice(7).trim(), 10);
       if (Number.isFinite(n)) args.depth = n;
-    }
+    } else if (arg === 'deepen-relative') args.deepenRelative = true;
+    else if (arg === 'done') args.done = true;
   }
   return { kind: 'fetch', args };
 }
@@ -406,14 +476,15 @@ function parseV0Body(
   const first = decodePktLines(body);
   if (first.error !== undefined) return { kind: 'invalid', reason: first.error };
   if (first.truncated) return { kind: 'invalid', reason: 'truncated pkt-line' };
-  const args: FetchV0Args = { wants: [], haves: [], shallow: [] };
+  const args: FetchV0Args = { wants: [], haves: [], shallow: [], done: false };
   for (const packet of first.packets) {
     if (packet.kind !== 'data' || packet.payload === undefined) continue;
     const text = packet.payload.toString('utf8').trim();
     if (text.startsWith('want ')) {
       // First want line may carry capabilities after a space; the oid is
-      // the first token after 'want '.
+      // the first token after 'want '. `deepen-relative` rides there too.
       args.wants.push(text.slice(5).trim().split(' ')[0]);
+      if (text.includes(' deepen-relative')) args.deepenRelative = true;
     } else if (text.startsWith('shallow ')) {
       // The client's current shallow boundaries: the server must NOT
       // treat objects beyond them as already held (see collectHeld).
@@ -421,6 +492,8 @@ function parseV0Body(
     } else if (text.startsWith('deepen ')) {
       const n = parseInt(text.slice(7).trim(), 10);
       if (Number.isFinite(n)) args.depth = n;
+    } else if (text === 'deepen-relative') {
+      args.deepenRelative = true;
     }
   }
   // Second section: haves + done, up to the next flush.
@@ -430,6 +503,7 @@ function parseV0Body(
     if (packet.kind !== 'data' || packet.payload === undefined) continue;
     const text = packet.payload.toString('utf8').trim();
     if (text.startsWith('have ')) args.haves.push(text.slice(5).trim());
+    else if (text === 'done') args.done = true;
   }
   if (args.wants.length === 0) return { kind: 'invalid', reason: 'no want lines' };
   return { kind: 'fetch', args };
@@ -605,7 +679,8 @@ function cachedLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
 function cachedFetchV2(repo: Repo, args: FetchArgs): Buffer {
   const key =
     `fetch2:${args.wants.join(',')}|${args.haves.join(',')}|` +
-    `${args.depth ?? ''}|${args.shallow.join(',')}`;
+    `${args.depth ?? ''}|${args.shallow.join(',')}|` +
+    `done${args.done ? 1 : 0}|rel${args.deepenRelative ? 1 : 0}`;
   let out = repo.responseCache.get(key);
   if (out === undefined) {
     out = handleFetchV2(repo, args);
@@ -617,7 +692,8 @@ function cachedFetchV2(repo: Repo, args: FetchArgs): Buffer {
 function cachedFetchV0(repo: Repo, args: FetchV0Args): Buffer {
   const key =
     `fetch0:${args.wants.join(',')}|${args.haves.join(',')}|` +
-    `${args.depth ?? ''}|${args.shallow.join(',')}`;
+    `${args.depth ?? ''}|${args.shallow.join(',')}|` +
+    `done${args.done ? 1 : 0}|rel${args.deepenRelative ? 1 : 0}`;
   let out = repo.responseCache.get(key);
   if (out === undefined) {
     out = handleFetchV0(repo, args);

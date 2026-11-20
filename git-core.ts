@@ -708,19 +708,60 @@ export function fetchPlan(
         shallow.push(oid);
       }
     }
-    const oldShallow = opts.shallowBoundaries ?? [];
-    for (const oid of oldShallow) {
-      if (!includedCommits.has(oid)) continue;
-      const obj = repo.objects.get(oid);
-      if (obj === undefined || obj.type !== 'commit') continue;
-      const commit = parseCommit(obj.data);
-      const parentsCovered = commit.parents.every(
-        (p) => includedCommits.has(p) || haveClosure.has(p),
-      );
-      if (parentsCovered) unshallow.push(oid);
-    }
+  }
+  // Unshallow is NOT gated on depth: a full fetch (no depth) from a shallow
+  // client delivers every parent, so every boundary it sent stops being
+  // shallow. (A boundary outside this fetch's closure is left alone.)
+  const oldShallow = opts.shallowBoundaries ?? [];
+  for (const oid of oldShallow) {
+    if (!includedCommits.has(oid)) continue;
+    const obj = repo.objects.get(oid);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    const commit = parseCommit(obj.data);
+    const parentsCovered = commit.parents.every(
+      (p) => includedCommits.has(p) || haveClosure.has(p),
+    );
+    if (parentsCovered) unshallow.push(oid);
   }
   return { objects, shallow, unshallow };
+}
+
+/**
+ * The client's current shallow depth, from its shallow boundaries: 1 +
+ * the smallest commit generation of a boundary reachable from the wants.
+ * Undefined when no boundary is reachable from the wants (e.g. the client
+ * is shallow on another branch). Used for `deepen-relative`: the effective
+ * depth is deepen + clientDepth.
+ */
+export function clientDepthFromBoundaries(repo: Repo, wants: Oid[], boundaries: Oid[]): number | undefined {
+  const boundarySet = new Set(boundaries);
+  let minGen: number | undefined;
+  const seen = new Set<Oid>();
+  const queue: Array<{ oid: Oid; gen: number }> = wants.map((oid) => ({ oid, gen: 0 }));
+  while (queue.length > 0) {
+    const { oid, gen } = queue.shift() as { oid: Oid; gen: number };
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    if (boundarySet.has(oid)) {
+      if (minGen === undefined || gen < minGen) minGen = gen;
+      continue; // Do not walk past a boundary.
+    }
+    const obj = repo.objects.get(oid);
+    if (obj === undefined) continue;
+    // A tag want peels to its commit at the SAME generation: a fetch that
+    // wants an annotated tag (git follows tags on every fetch) still
+    // deepens from the peeled tip, not from the tag object itself.
+    if (obj.type === 'tag') {
+      const target = parseTag(obj.data).object;
+      if (target !== '') queue.push({ oid: target, gen });
+      continue;
+    }
+    if (obj.type !== 'commit') continue;
+    for (const parent of parseCommit(obj.data).parents) {
+      queue.push({ oid: parent, gen: gen + 1 });
+    }
+  }
+  return minGen === undefined ? undefined : minGen + 1;
 }
 
 // ---------------------------------------------------------------------------
